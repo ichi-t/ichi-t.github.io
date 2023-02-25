@@ -1,0 +1,166 @@
+---
+title: NatureRemoとMachinistで始める簡単室温記録
+date: 2018-12-14
+description: NatureRemo
+defer: false
+tags:
+  - Tutorial
+---
+この記事は [PMOB Advent Calendar 2018 - Adventar](https://adventar.org/calendars/3478) の14日目の記事です。
+
+どうもいっちーです。
+最近めっちゃ寒いですね。
+寒くなるとエアコンの暖房を入れるんですが、エアコンのリモコンってすぐどっかにいきますよね。
+そこでスマホからエアコンなどの赤外線リモコンを使う家電の操作ができるNatureRemoという製品を導入してるのですが、これがかなり便利で重宝してます。
+
+## NatureRemoって？
+
+
+[https://nature.global/:embed:cite]
+
+
+赤外線リモコンを代替するいわゆるスマートリモコンというやつです。
+スマートリモコンってのは家電リモコンが発するシグナルを登録しといてスマホアプリの操作でシグナルを送信してくれる類の製品です。
+NatureRemoは上記の機能に加えてメジャーなエアコン製品なんかのシグナルがプリセットとして登録されていて登録が簡単っていうのが特徴です。
+
+それだけじゃなくてですね、おまけ(?)として、いろんなセンサーが載ってるんですよ。
+
+- 温度センサー
+- 湿度センサー
+- 照度センサー
+- 人感センサー
+
+これが何に使われるかというと、家電をスマホから操作するだけじゃなくてこれらのセンサーをトリガーとできるんです。
+<figure class="figure-image figure-image-fotolife" title="ルール設定">[f:id:kurosanex:20181214204214p:plain]<figcaption>ルール設定</figcaption></figure>
+
+スマホからの操作を想定された製品設計になってるんですがAPIも用意されてます。
+[https://developer.nature.global/]
+
+## お家の室温情報を記録したい。
+エアコンって設定温度ありますよね。操作する側としてはエアコンは設定された温度になるようによしなに動いてくれてるんだと想像してますが、設定した室温になってるかどうかはエアコンだけじゃわからないですよね。
+現在の室温と設定温度を鑑みて動いてくれているのであればエアコンは現在の室温をしっているわけで、それをリモコンとかに表示してくれた方がユーザフレンドリーですよね。私が知らないだけで室温表示のあるエアコンあるのかしら。
+
+そんなわけかはわかりませんがNatureRemoのアプリではエアコン操作時に室温表示がついてます。便利。エアコンのパワーは製品ごとに違うので操作する人が室温を鑑みながら設定温度を操作できて良いです。
+
+というような使い方をしていたらエアコンのパワーが気になり始めました。
+エアコンのパワーは電源を入れてから快適な温度に近くまでの速さだと思ってるんですが、これを測る為には室温を継続的に測る必要があります。
+NatureRemoのアプリで確認できるのは現時点での情報だけです。せっかくAPIも公開されてるしということで室温記録環境を整えました。
+
+### 方針
+ちょっと前であれば自宅サーバで動かすぞ!となってましたが最近はめっきり面倒くさがりになりました。方針としてはなるだけマネージメントサービスに頼っていく方向。
+
+### 必要なコンポーネント
+室温記録してグラフ表示するのに必要なコンポーネントはざっとこんな感じでしょうか。
+
+- 室温センサ
+  - お部屋にあったNatureRemoを活用
+- 室温を表示するアプリ
+  - Machinist
+- 室温を保持するDB
+  - Machinist
+- 室温をDBに格納するバックエンドアプリ
+  - Ruby + Sidekiq
+
+#### 室温センサ
+クラウドAPIから簡単に室温が取れて、お家で稼働中のNatureRemoを使いました。
+
+
+#### 室温をDBに格納するバックエンドアプリ
+NatureRemoのクラウドAPIから室温を取得して後述のMachinistにPOSTするやつを作りました。
+
+NatureRemoからの温度取得はこれ
+[https://github.com/ichi-t/nature_remo:embed:cite]
+MachinistへのPOSTはこの辺りの便利なgemを使ってさっくり書きました。
+[https://github.com/lostisland/faraday:embed:cite]
+[https://github.com/mperham/sidekiq:embed:cite]
+
+できたものはdocker container image にして EC2で動かしてます。
+
+```ruby
+require 'sidekiq'
+require 'sidekiq-cron'
+require 'nature_remo'
+require 'faraday'
+
+
+Sidekiq.configure_client do |config|
+  config.redis = { url: 'redis://redis-server:6379' }
+end
+
+Sidekiq.configure_server do |config|
+  config.redis = { url: 'redis://redis-server:6379' }
+end
+
+class GetTempertureWorker
+  include Sidekiq::Worker
+
+  def perform
+    p t = client.get_temp
+    p h = client.get_humi
+    conn = Faraday.new(:url => 'https://gw.machinist.iij.jp') do |faraday|
+
+      faraday.adapter Faraday.default_adapter
+    end
+
+    conn.post do |req|
+      req.url '/endpoint'
+      req.headers['Content-Type'] = 'application/json'
+      req.headers['Authorization'] = "Bearer #{ENV['MACHINIST_TOKEN']}"
+      req.body = "{
+  \"agent\": \"Home\",
+  \"metrics\": [
+    {
+      \"name\": \"temperature\",
+      \"namespace\": \"Environment Sensor\",
+      \"data_point\": {
+        \"value\": #{t}
+      }
+    },
+    {
+      \"name\": \"humidity\",
+      \"namespace\": \"Environment Sensor\",
+      \"data_point\": {
+        \"value\": #{h}
+      }
+    }
+  ]
+}"
+    end
+  end
+
+  private
+  def client
+    client ||= NatureRemo::Client.new
+  end
+end
+
+Sidekiq::Cron::Job.create(name: 'Get Temp Worker - every minute',
+                          cron: '*/5 * * * *',
+                          class: 'GetTempertureWorker'
+                         )
+```
+
+書いたのはこれだけです。
+
+#### 室温を表示するアプリ && DB
+
+
+[https://machinist.iij.jp/:embed:cite]
+
+
+最近ベータ公開されたMachinistを使ってみました。モニタリングだとmackerelとかが有名ですが、新しい物好きなので。
+登録してAPIキーつけてPOSTするだけの簡単仕様。
+
+## 一週間貯めてみた
+丸々一週間室温記録したのがこちら。ドラッグで拡大できます。
+<iframe src="https://app.machinist.iij.jp/embed/chart/87c361330168f9246cd45dee47fa6b22?toolbar=false&legend=true&datatable=false&theme=Dark&type=lineChart&period=week&to=1544799599&reload=" frameborder="0" scrolling="no" width="800px" height="300px"></iframe>
+帰宅時と、起床前に暖房つけてるのでそこが跳ねてるのがよくわかります。
+12/10から特に室温が落ちてますがこのあたりから東京の最低気温が5度を下回るようになりました。室温もそれに引っ張られてますね寒い。
+
+エアコンの設定温度は毎度28度でONしてますが、室温の上がりはじめからピークまで3時間ほどかかってるのがわかります。エアコンはあったまらないですね。
+
+
+
+## まとめ
+NatureRemoとMachinistを使って室温を記録していく雰囲気だけお伝えしました。室温を継続的に記録していくことで、よりお部屋の状態にあった暖房、冷房家電の選定に活かせそうです。
+せっかくcontainerにしたのにEC2で動かしてるのは勿体無い気がするので今度はECSにあげよう。
